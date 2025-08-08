@@ -1,0 +1,12 @@
+- [x] Create project structure and dependencies (requirements.txt, .env.example)
+- [x] Implement configuration management (config.py)
+- [x] Create database layer (storage/db.py)
+- [x] Implement RNG and card deck services (services/rng.py, services/deck.py)
+- [x] Create UI keyboards (ui/keyboards.py)
+- [x] Implement Blackjack game (games/blackjack.py)
+- [x] Implement 21 simplified game (games/simple21.py)
+- [x] Implement Roulette game (games/roulette.py)
+- [x] Create main bot entry point (bot.py)
+- [x] Update README with setup instructions
+- [ ] Test bot functionality
+- [ ] Verify all features work as specified
