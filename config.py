@@ -26,6 +26,8 @@ class Config:
     @classmethod
     def validate(cls) -> None:
         """Validate required configuration values."""
+        # Reload the token from environment
+        cls.TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
         if not cls.TELEGRAM_BOT_TOKEN:
             raise ValueError("TELEGRAM_BOT_TOKEN is required")
         
