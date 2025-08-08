@@ -1,30 +1,17 @@
-"""Cryptographically secure random number generation."""
 import secrets
-from typing import List, Any
+from typing import List, Sequence, TypeVar
 
+T = TypeVar("T")
 
-class SecureRNG:
-    """Cryptographically secure random number generator using secrets module."""
-    
-    def __init__(self):
-        self.rng = secrets.SystemRandom()
-    
-    def randint(self, a: int, b: int) -> int:
-        """Generate secure random integer between a and b (inclusive)."""
-        return self.rng.randint(a, b)
-    
-    def choice(self, sequence: List[Any]) -> Any:
-        """Choose secure random element from sequence."""
-        return self.rng.choice(sequence)
-    
-    def shuffle(self, sequence: List[Any]) -> None:
-        """Securely shuffle sequence in place."""
-        self.rng.shuffle(sequence)
-    
-    def sample(self, population: List[Any], k: int) -> List[Any]:
-        """Secure random sample of k elements from population."""
-        return self.rng.sample(population, k)
+def randint(a: int, b: int) -> int:
+    # Inclusive range
+    return secrets.randbelow(b - a + 1) + a
 
+def choice(seq: Sequence[T]) -> T:
+    return secrets.choice(seq)
 
-# Global secure RNG instance
-rng = SecureRNG()
+def shuffle(seq: List[T]) -> None:
+    # Fisher-Yates using secrets for unbiased shuffling
+    for i in range(len(seq) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        seq[i], seq[j] = seq[j], seq[i]
