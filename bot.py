@@ -72,11 +72,11 @@ def build_simple21_actions_kb() -> InlineKeyboardMarkup:
     ])
 
 async def end_simple21_and_payout(user_id: int, delta: int) -> dict:
-    # Apply balance delta and clear state
-    # Assumes Database has change_balance(user_id, delta)
-    await db.change_balance(user_id, delta)
+    # Get current balance, apply delta, persist, clear round, return updated user
+    user = await db.get_or_create_user(user_id, None)
+    new_balance = user["balance"] + delta
+    await db.update_balance(user_id, new_balance)
     GAME21_STATE.pop(user_id, None)
-    # Return updated user
     return await db.get_or_create_user(user_id, None)
 
 # ---- Handlers ----
