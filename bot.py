@@ -17,7 +17,7 @@ from aiogram.types import (
 from config import get_settings
 from storage.db import Database
 from ui.keyboards import main_menu_kb, back_menu_kb
-from services.cards import format_hand_with_total, calculate_hand_value, SUITS
+from services.cards import format_hand_with_total, calculate_hand_value, SUITS, HIDDEN_CARD
 
 # ------------------------------------------------------------------------------------
 # Settings / DB
@@ -44,6 +44,48 @@ def draw_card_with_suit() -> str:
     rank = random.choice(CARD_VALUES)
     suit = random.choice(SUITS)
     return f"{rank}{suit}"
+
+
+def format_hand_display(cards: List[str]) -> str:
+    """Format a list of card ranks with Unicode suits for display."""
+    if not cards:
+        return ""
+    
+    # Add random suits to ranks for display
+    display_cards = []
+    for rank in cards:
+        if len(rank) > 2:  # Already has suit
+            display_cards.append(rank)
+        else:  # Just rank, add suit
+            suit = random.choice(SUITS)
+            display_cards.append(f"{rank}{suit}")
+    
+    total = calculate_hand_value(cards)
+    return f"{' '.join(display_cards)} (total: {total})"
+
+
+def format_hand_display_with_hidden(cards: List[str], hide_first: bool = False) -> str:
+    """Format hand with optional hidden first card and Unicode suits."""
+    if not cards:
+        return ""
+    
+    if hide_first and len(cards) > 1:
+        visible_cards = cards[1:]
+        total = calculate_hand_value(visible_cards)
+        
+        # Add suits to visible cards
+        display_cards = []
+        for rank in visible_cards:
+            if len(rank) > 2:  # Already has suit
+                display_cards.append(rank)
+            else:  # Just rank, add suit
+                suit = random.choice(SUITS)
+                display_cards.append(f"{rank}{suit}")
+        
+        card_display = f"{HIDDEN_CARD} {' '.join(display_cards)}"
+        return f"{card_display} (showing: {total})"
+    else:
+        return format_hand_display(cards)
 
 
 def build_simple21_bet_kb(balance: int, has_active_round: bool = False) -> InlineKeyboardMarkup:
@@ -286,12 +328,12 @@ async def game_simple21(cb: CallbackQuery):
         bet = active_round['bet']
         
         player_total = calculate_hand_value(state['player'])
-        dealer_showing = format_hand_with_total(state['dealer'], hide_first=True)
+        dealer_showing = format_hand_display_with_hidden(state['dealer'], hide_first=True)
         
         text = (
             f"2️⃣1️⃣ <b>Simple 21</b> (continued)\n"
             f"💰 <b>Bet:</b> {bet} credits\n\n"
-            f"🎲 <b>Your hand:</b> {format_hand_with_total(state['player'])}\n"
+            f"🎲 <b>Your hand:</b> {format_hand_display(state['player'])}\n"
             f"🎯 <b>Dealer shows:</b> {dealer_showing}"
         )
         
@@ -354,12 +396,12 @@ async def simple21_place_bet(cb: CallbackQuery):
         return await cb.answer("❌ Failed to start round. Try again.", show_alert=True)
 
     player_total = calculate_hand_value(player)
-    dealer_showing = format_hand_with_total(dealer, hide_first=False)  # Only one card, so show it
+    dealer_showing = format_hand_display(dealer)  # Only one card, so show it
 
     text = (
         f"2️⃣1️⃣ <b>Simple 21</b>\n"
         f"💰 <b>Bet:</b> {bet} credits (locked)\n\n"
-        f"🎲 <b>Your hand:</b> {format_hand_with_total(player)}\n"
+        f"🎲 <b>Your hand:</b> {format_hand_display(player)}\n"
         f"🎯 <b>Dealer shows:</b> {dealer_showing}"
     )
     
@@ -399,8 +441,8 @@ async def simple21_same_bet(cb: CallbackQuery):
     text = (
         f"2️⃣1️⃣ <b>Simple 21</b>\n"
         f"💰 <b>Bet:</b> {bet} credits (locked)\n\n"
-        f"🎲 <b>Your hand:</b> {format_hand_with_total(player)}\n"
-        f"🎯 <b>Dealer shows:</b> {format_hand_with_total(dealer, hide_first=False)}"
+        f"🎲 <b>Your hand:</b> {format_hand_display(player)}\n"
+        f"🎯 <b>Dealer shows:</b> {format_hand_display(dealer)}"
     )
     
     await cb.message.edit_text(text, reply_markup=build_simple21_actions_kb(), parse_mode=ParseMode.HTML)
@@ -433,8 +475,8 @@ async def simple21_hit(cb: CallbackQuery):
         
         text = (
             f"💥 <b>BUST!</b>\n\n"
-            f"🎲 <b>Your hand:</b> {format_hand_with_total(state['player'])}\n"
-            f"🎯 <b>Dealer:</b> {format_hand_with_total(state['dealer'])}\n\n"
+            f"🎲 <b>Your hand:</b> {format_hand_display(state['player'])}\n"
+            f"🎯 <b>Dealer:</b> {format_hand_display(state['dealer'])}\n\n"
             f"❌ <b>Result:</b> Lost {bet} credits\n"
             f"💰 <b>Balance:</b> {user['balance']} credits"
         )
@@ -452,8 +494,8 @@ async def simple21_hit(cb: CallbackQuery):
     text = (
         f"2️⃣1️⃣ <b>Simple 21</b>\n"
         f"💰 <b>Bet:</b> {bet} credits\n\n"
-        f"🎲 <b>Your hand:</b> {format_hand_with_total(state['player'])}\n"
-        f"🎯 <b>Dealer shows:</b> {format_hand_with_total(state['dealer'], hide_first=False)}"
+        f"🎲 <b>Your hand:</b> {format_hand_display(state['player'])}\n"
+        f"🎯 <b>Dealer shows:</b> {format_hand_display(state['dealer'])}"
     )
     
     await cb.message.edit_text(text, reply_markup=build_simple21_actions_kb(), parse_mode=ParseMode.HTML)
@@ -502,8 +544,8 @@ async def simple21_stand(cb: CallbackQuery):
 
     text = (
         f"{result_icon} <b>ROUND COMPLETE</b>\n\n"
-        f"🎲 <b>Your hand:</b> {format_hand_with_total(state['player'])}\n"
-        f"🎯 <b>Dealer hand:</b> {format_hand_with_total(dealer)}\n\n"
+        f"🎲 <b>Your hand:</b> {format_hand_display(state['player'])}\n"
+        f"🎯 <b>Dealer hand:</b> {format_hand_display(dealer)}\n\n"
         f"📊 <b>Result:</b> {outcome}\n"
         f"💰 <b>Balance:</b> {user['balance']} credits"
     )
