@@ -1,15 +1,13 @@
-# games/blackjack.py
 """
-Full Blackjack game engine module compatible with the existing bot.
-Provides BlackjackState (serializable), helpers to evaluate rounds and UI formatting.
-Designed to be imported as `from games import blackjack`.
+Enhanced Blackjack engine module.
 
-It expects the bot to store the JSON-serialized state returned by BlackjackState.to_json()
-in the `active_rounds` table (via your existing Database API).
-
-Payout convention: payout values are "gross" like in your DB: 0 for loss, bet for push,
-2*bet for normal win, blackjack pays bet + floor(1.5*bet) (so returned value = bet + 1.5*bet).
-This matches the existing `resolve_active_round` contract in your db.py.
+Features:
+- Serializable BlackjackState
+- Split (pair) support with optional re-splitting (config at top)
+- Double (flag stored; stake logic handled by bot/db layer)
+- Surrender support (bot sets surrendered flags)
+- Dealer reveal & stepwise drawing support (.dealer_play_step)
+- Gross payout evaluation (0 loss, bet push, 2*bet win, bet + floor(1.5*bet) blackjack, floor(bet/2) surrender)
 """
 
 import json
@@ -17,9 +15,18 @@ import random
 import math
 from typing import List, Dict, Any
 
-# try to reuse formatting / calc helpers from services.cards if present
+# Optional: override rules here
+MAX_SPLIT_HANDS = 4            # Max total hands allowed
+ALLOW_10_VALUE_FAMILY = False  # If True, allow splitting any 10/J/Q/K combination
+ALLOW_RE_SPLIT = True          # Allow multiple splits until MAX_SPLIT_HANDS reached
+
 try:
-    from services.cards import format_hand_with_total, calculate_hand_value, SUITS, HIDDEN_CARD
+    from services.cards import (
+        format_hand_with_total,
+        calculate_hand_value,
+        SUITS,
+        HIDDEN_CARD
+    )
 except Exception:  # fallback minimal implementations
     SUITS = ["♠", "♥", "♦", "♣"]
     HIDDEN_CARD = "🂠"
@@ -28,8 +35,7 @@ except Exception:  # fallback minimal implementations
         total = 0
         aces = 0
         for c in cards:
-            # card format: <rank><suit> (e.g. 10♠ or A♦)
-            rank = c[:-1] if len(c) > 1 else c
+            rank = c[:-1]
             if rank in ("J", "Q", "K"):
                 total += 10
             elif rank == "A":
@@ -39,16 +45,14 @@ except Exception:  # fallback minimal implementations
                 try:
                     total += int(rank)
                 except Exception:
-                    total += 0
+                    pass
         while total > 21 and aces:
             total -= 10
             aces -= 1
         return total
 
     def format_hand_with_total(cards: List[str]) -> str:
-        if not cards:
-            return ""
-        return f"{' '.join(cards)} (total: {calculate_hand_value(cards)})"
+        return f"{' '.join(cards)} (total: {calculate_hand_value(cards)})" if cards else ""
 
 
 RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
@@ -62,25 +66,24 @@ def make_deck(shuffle: bool = True) -> List[str]:
 
 
 class BlackjackState:
-    """Serializable state for a blackjack round.
-
-    Structure (stored in .state dict):
-      - deck: list[str] remaining deck
-      - player_hands: list[list[str]]
-      - bets: list[int]
-      - current_hand: int
-      - dealer: list[str]
-      - dealer_visible: list[str] (HIDDEN_CARD for hidden spots)
-      - doubled: list[bool]
-      - surrendered: list[bool]
-      - finished: bool
-      - result: Optional[str]
-      - original_bet: int
+    """
+    State layout (in self.state dict):
+      deck: list[str]
+      player_hands: list[list[str]]
+      bets: list[int]
+      current_hand: int
+      dealer: list[str]
+      dealer_visible: list[str]
+      doubled: list[bool]
+      surrendered: list[bool]
+      finished: bool
+      result: Optional[str]
+      original_bet: int    (the initial single bet value)
+      split_count: int     (how many splits performed)
     """
 
     def __init__(self, bet: int):
         deck = make_deck()
-        # initial draws: two to player, two to dealer
         p1 = [deck.pop(), deck.pop()]
         d1 = [deck.pop(), deck.pop()]
         self.state: Dict[str, Any] = {
@@ -95,120 +98,129 @@ class BlackjackState:
             "finished": False,
             "result": None,
             "original_bet": bet,
+            "split_count": 0,
         }
 
+    # ---------- Serialization ----------
     def to_json(self) -> str:
         return json.dumps(self.state)
 
     @classmethod
     def from_json(cls, data: str) -> "BlackjackState":
         obj = cls(1)
-        loaded = json.loads(data)
-        obj.state = loaded
+        obj.state = json.loads(data)
         return obj
 
-    # deck operations
+    # ---------- Deck ----------
     def draw(self) -> str:
         deck = self.state.get("deck", [])
         if not deck:
             deck = make_deck()
             self.state["deck"] = deck
-        return self.state["deck"].pop()
+        return deck.pop()
 
-    # helpers for current player hand
+    # ---------- Helpers ----------
     def current_hand(self) -> List[str]:
         return self.state["player_hands"][self.state["current_hand"]]
 
+    def hand_rank_pair(self, hand: List[str]) -> bool:
+        if len(hand) != 2:
+            return False
+        r1, r2 = hand[0][:-1], hand[1][:-1]
+        if r1 == r2:
+            return True
+        if ALLOW_10_VALUE_FAMILY:
+            ten_vals = {"10", "J", "Q", "K"}
+            return r1 in ten_vals and r2 in ten_vals
+        return False
+
     def can_split(self) -> bool:
-        hand = self.current_hand()
-        return len(hand) == 2 and hand[0][:-1] == hand[1][:-1]
+        if len(self.state["player_hands"]) >= MAX_SPLIT_HANDS:
+            return False
+        if not ALLOW_RE_SPLIT and self.state.get("split_count", 0) > 0:
+            return False
+        return self.hand_rank_pair(self.current_hand())
 
     def can_double(self) -> bool:
         return len(self.current_hand()) == 2
 
     def is_blackjack(self, hand: List[str]) -> bool:
-        return calculate_hand_value(hand) == 21 and len(hand) == 2
+        return len(hand) == 2 and calculate_hand_value(hand) == 21
 
     def reveal_dealer(self) -> None:
         self.state["dealer_visible"] = self.state["dealer"].copy()
 
-    def dealer_play(self) -> None:
-        # Dealer stands on soft 17 (standard casino rule implemented)
-        while calculate_hand_value(self.state["dealer"]) < 17:
-            card = self.draw()
-            self.state["dealer"].append(card)
-            # make card visible immediately
-            self.state["dealer_visible"].append(card)
+    def dealer_play_step(self) -> bool:
+        """Draw one card if dealer must hit; return True if drew."""
+        if calculate_hand_value(self.state["dealer"]) < 17:
+            c = self.draw()
+            self.state["dealer"].append(c)
+            self.state["dealer_visible"].append(c)
+            return True
+        return False
 
+    def dealer_play_full(self) -> None:
+        while self.dealer_play_step():
+            pass
+
+    # ---------- Evaluation ----------
     def evaluate(self) -> Dict[str, Any]:
-        """Evaluate each player hand vs dealer and produce results.
-
-        Returns a dict with keys:
-          - dealer_total: int
-          - results: list of tuples (result_type, payout, message)
-            where payout is the gross amount to credit (0/loss, bet/push, 2*bet/win,
-            blackjack -> bet + floor(1.5*bet)).
-        """
-        results = []
         dealer_total = calculate_hand_value(self.state["dealer"])
-
-        for idx, hand in enumerate(self.state["player_hands"]):
-            bet = self.state["bets"][idx]
+        results = []
+        for i, hand in enumerate(self.state["player_hands"]):
+            bet = self.state["bets"][i]
             player_total = calculate_hand_value(hand)
 
-            # surrender
-            if idx < len(self.state.get("surrendered", [])) and self.state.get("surrendered")[idx]:
-                # return half of bet as payout (gross)
+            # Surrender
+            if i < len(self.state.get("surrendered", [])) and self.state["surrendered"][i]:
                 half = math.floor(bet / 2)
-                msg = f"⚠️ Hand {idx+1} surrendered, returned {half} credits"
-                results.append(("surrender", half, msg))
+                results.append(("surrender", half, f"⚠️ Hand {i+1} surrendered, returned {half}"))
                 continue
 
-            # natural blackjack
+            # Natural blackjack
             if self.is_blackjack(hand):
                 if self.is_blackjack(self.state["dealer"]):
-                    results.append(("push", bet, f"🤝 Hand {idx+1} push (both BJ)"))
+                    results.append(("push", bet, f"🤝 Hand {i+1} push (both BJ)"))
                 else:
-                    bj_extra = math.floor(1.5 * bet)
-                    payout = bet + bj_extra
-                    results.append(("win", payout, f"🏆 Hand {idx+1} Blackjack +{bj_extra}"))
+                    extra = math.floor(1.5 * bet)
+                    payout = bet + extra
+                    results.append(("win", payout, f"🏆 Hand {i+1} Blackjack +{extra}"))
                 continue
 
-            # bust
+            # Bust
             if player_total > 21:
-                results.append(("loss", 0, f"💥 Hand {idx+1} busted -{bet}"))
+                results.append(("loss", 0, f"💥 Hand {i+1} busted -{bet}"))
                 continue
 
-            # compare
+            # Compare
             if dealer_total > 21 or player_total > dealer_total:
-                payout = 2 * bet
-                results.append(("win", payout, f"🏆 Hand {idx+1} wins +{bet}"))
+                results.append(("win", 2 * bet, f"🏆 Hand {i+1} wins +{bet}"))
             elif player_total < dealer_total:
-                results.append(("loss", 0, f"💥 Hand {idx+1} loses -{bet}"))
+                results.append(("loss", 0, f"💥 Hand {i+1} loses -{bet}"))
             else:
-                results.append(("push", bet, f"🤝 Hand {idx+1} push"))
+                results.append(("push", bet, f"🤝 Hand {i+1} push"))
 
         return {"dealer_total": dealer_total, "results": results}
 
 
-# UI helpers
-def format_hand(cards: List[str], hide_first: bool = False) -> str:
-    if not cards:
-        return ""
-    if hide_first and len(cards) > 1:
-        visible = " ".join(cards[1:])
-        return f"{HIDDEN_CARD} {visible}"
+# ---------- UI Helpers ----------
+def format_hand(cards: List[str]) -> str:
     return " ".join(cards)
 
-
-def format_state_for_display(state_obj: BlackjackState, reveal_dealer: bool = False) -> str:
-    dealer_display = (
-        " ".join(state_obj.state["dealer"]) if reveal_dealer else " ".join(state_obj.state.get("dealer_visible", []))
-    )
-    text = f"🃏 <b>Blackjack</b>\n"
+def format_state_for_display(state_obj: BlackjackState, show_dealer_full: bool = False, highlight_current: bool = True) -> str:
+    dealer_disp = " ".join(state_obj.state["dealer"]) if show_dealer_full else " ".join(state_obj.state["dealer_visible"])
+    text = "🃏 <b>Blackjack</b>\n"
     text += f"💰 Bet: {state_obj.state.get('original_bet', 0)} credits\n\n"
-    for i, hand in enumerate(state_obj.state["player_hands"]):
-        prefix = "👉 " if i == state_obj.state["current_hand"] else "   "
-        text += f"{prefix}Your hand #{i+1}: {format_hand(cards=hand)} (total: {calculate_hand_value(hand)})\n"
-    text += f"\n🀫 Dealer: {dealer_display}"
+    for idx, hand in enumerate(state_obj.state["player_hands"]):
+        marker = "👉" if highlight_current and idx == state_obj.state["current_hand"] else "  "
+        total = calculate_hand_value(hand)
+        text += f"{marker} Hand {idx+1}: {format_hand(hand)} (total: {total})\n"
+    text += f"\n🀫 Dealer: {dealer_disp}"
     return text
+
+def format_final_results(state_obj: BlackjackState, eval_res: Dict[str, Any]) -> str:
+    out = "🃏 <b>Blackjack — Round Complete</b>\n\n"
+    for idx, (hand, (typ, payout, msg)) in enumerate(zip(state_obj.state["player_hands"], eval_res["results"])):
+        out += f"🎲 Hand {idx+1}: {format_hand_with_total(hand)} — {msg}\n"
+    out += f"\n🀫 Dealer: {format_hand_with_total(state_obj.state['dealer'])}\n"
+    return out
