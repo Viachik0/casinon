@@ -1,591 +1,636 @@
+# bot.py (полная версия)
 import asyncio
 import json
-import random
-from typing import Dict, List
+import math
+from typing import List
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
-    Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    Message,
 )
 
 from config import get_settings
 from storage.db import Database
-from ui.keyboards import main_menu_kb, back_menu_kb
-from services.cards import format_hand_with_total, calculate_hand_value, SUITS, HIDDEN_CARD
 
-# ------------------------------------------------------------------------------------
-# Settings / DB
-# ------------------------------------------------------------------------------------
+# import game modules
+from games import simple21, blackjack
+
+# settings and db (use your existing config)
 settings = get_settings()
 db = Database(settings.db_path, starting_balance=settings.starting_balance)
 
 router = Router()
 
-# ------------------------------------------------------------------------------------
-# Simple 21 (Blackjack-lite) implementation with persistent state
-# ------------------------------------------------------------------------------------
-
-CARD_VALUES: List[str] = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-
-
-def draw_card() -> str:
-    """Draw a random card rank."""
-    return random.choice(CARD_VALUES)
+# ----- UI helpers (buttons/kbs) -----
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Simple 21", callback_data="game:simple21")],
+        [InlineKeyboardButton(text="🃏 Blackjack", callback_data="game:blackjack")],
+        [InlineKeyboardButton(text="🎡 Roulette (coming soon)", callback_data="game:roulette")],
+    ])
 
 
-def draw_card_with_suit() -> str:
-    """Draw a random card with Unicode suit for display."""
-    rank = random.choice(CARD_VALUES)
-    suit = random.choice(SUITS)
-    return f"{rank}{suit}"
+def back_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="nav:menu")]
+    ])
 
 
-def format_hand_display(cards: List[str]) -> str:
-    """Format a list of card ranks with Unicode suits for display."""
-    if not cards:
-        return ""
-    
-    # Add random suits to ranks for display
-    display_cards = []
-    for rank in cards:
-        if len(rank) > 2:  # Already has suit
-            display_cards.append(rank)
-        else:  # Just rank, add suit
-            suit = random.choice(SUITS)
-            display_cards.append(f"{rank}{suit}")
-    
-    total = calculate_hand_value(cards)
-    return f"{' '.join(display_cards)} (total: {total})"
-
-
-def format_hand_display_with_hidden(cards: List[str], hide_first: bool = False) -> str:
-    """Format hand with optional hidden first card and Unicode suits."""
-    if not cards:
-        return ""
-    
-    if hide_first and len(cards) > 1:
-        visible_cards = cards[1:]
-        total = calculate_hand_value(visible_cards)
-        
-        # Add suits to visible cards
-        display_cards = []
-        for rank in visible_cards:
-            if len(rank) > 2:  # Already has suit
-                display_cards.append(rank)
-            else:  # Just rank, add suit
-                suit = random.choice(SUITS)
-                display_cards.append(f"{rank}{suit}")
-        
-        card_display = f"{HIDDEN_CARD} {' '.join(display_cards)}"
-        return f"{card_display} (showing: {total})"
-    else:
-        return format_hand_display(cards)
-
-
-def build_simple21_bet_kb(balance: int, has_active_round: bool = False) -> InlineKeyboardMarkup:
-    """Build betting keyboard, with Same Bet option if there's an active round."""
-    min_bet = max(settings.min_bet, 1)
-    max_bet = min(settings.max_bet, balance)
-    suggestions = [min_bet, min_bet * 2, min_bet * 5, min_bet * 10, max_bet]
-    amounts = sorted({a for a in suggestions if min_bet <= a <= max_bet})
-    
-    rows = []
-    row = []
-    for a in amounts:
-        row.append(InlineKeyboardButton(text=f"Bet {a}", callback_data=f"game:simple21:bet:{a}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    
-    if has_active_round:
-        rows.append([InlineKeyboardButton(text="📄 Continue Round", callback_data="game:simple21:continue")])
-    
-    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def build_simple21_actions_kb(can_same_bet: bool = False, last_bet: int = 0) -> InlineKeyboardMarkup:
-    """Build action keyboard with enhanced buttons."""
-    rows = [
+def build_simple21_actions_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🃏 Hit", callback_data="game:simple21:hit"),
-            InlineKeyboardButton(text="🛑 Stand", callback_data="game:simple21:stand"),
+            InlineKeyboardButton(text="🃏 Hit", callback_data="simple21:hit"),
+            InlineKeyboardButton(text="🛑 Stand", callback_data="simple21:stand"),
         ],
-        [InlineKeyboardButton(text="📋 Menu", callback_data="nav:menu")],
-    ]
-    
-    if can_same_bet and last_bet > 0:
-        rows.insert(-1, [InlineKeyboardButton(text=f"🔄 Same Bet ({last_bet})", callback_data=f"game:simple21:same_bet:{last_bet}")])
-    
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        [InlineKeyboardButton(text="⬅️ Menu", callback_data="nav:menu")]
+    ])
 
 
 def build_simple21_result_kb(last_bet: int, balance: int) -> InlineKeyboardMarkup:
-    """Build result keyboard with replay options."""
     rows = []
-    
     if last_bet <= balance:
-        rows.append([InlineKeyboardButton(text=f"🔄 Same Bet ({last_bet})", callback_data=f"game:simple21:same_bet:{last_bet}")])
-    
-    rows.extend([
-        [InlineKeyboardButton(text="🎰 New Game", callback_data="game:simple21")],
-        [InlineKeyboardButton(text="📋 Menu", callback_data="nav:menu")],
-    ])
-    
+        rows.append([InlineKeyboardButton(text=f"🔄 Same Bet ({last_bet})", callback_data=f"simple21:same:{last_bet}")])
+    rows.append([InlineKeyboardButton(text="🎰 New Game", callback_data="game:simple21")])
+    rows.append([InlineKeyboardButton(text="📋 Main Menu", callback_data="nav:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ------------------------------------------------------------------------------------
-# Navigation
-# ------------------------------------------------------------------------------------
+def build_blackjack_actions_kb(can_double: bool = False, can_split: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="🃏 Hit", callback_data="blackjack:hit"),
+            InlineKeyboardButton(text="🛑 Stand", callback_data="blackjack:stand"),
+        ]
+    ]
+    extra = []
+    if can_double:
+        extra.append(InlineKeyboardButton(text="💰 Double", callback_data="blackjack:double"))
+    if extra:
+        rows[0].extend(extra)
+    if can_split:
+        rows.append([InlineKeyboardButton(text="🔀 Split", callback_data="blackjack:split")])
+    rows.append([InlineKeyboardButton(text="⬅️ Menu", callback_data="nav:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_blackjack_result_kb(original_bet: int, balance: int) -> InlineKeyboardMarkup:
+    rows = []
+    if original_bet <= balance:
+        rows.append([InlineKeyboardButton(text=f"🔄 Same Bet ({original_bet})", callback_data=f"blackjack:same:{original_bet}")])
+    rows.append([InlineKeyboardButton(text="🎰 New Game", callback_data="game:blackjack")])
+    rows.append([InlineKeyboardButton(text="📋 Main Menu", callback_data="nav:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ----- Commands / navigation -----
+@router.message(Command("start"))
+async def cmd_start(msg: Message):
+    user = await db.get_or_create_user(msg.from_user.id, msg.from_user.username)
+    text = (
+        f"🎰 <b>Casinon</b>\n\n"
+        f"Welcome, <b>{msg.from_user.first_name or msg.from_user.username}</b>!\n"
+        f"💰 Balance: {user['balance']} credits\n\n"
+        "Choose a game:"
+    )
+    await msg.answer(text, reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
+
+
 @router.callback_query(F.data == "nav:menu")
 async def nav_menu(cb: CallbackQuery):
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    
-    # Check if user has active round and offer to abandon it
-    active_round = await db.get_active_round(cb.from_user.id)
-    if active_round:
-        await cb.message.edit_text(
-            f"⚠️ You have an active {active_round['game']} round with bet {active_round['bet']}.\n\n"
-            "Returning to menu will abandon this round and forfeit your bet.\n"
-            "Are you sure?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Yes, abandon", callback_data="nav:menu:confirm"),
-                    InlineKeyboardButton(text="❌ No, go back", callback_data=f"game:{active_round['game']}")
-                ]
-            ])
-        )
-    else:
-        await cb.message.edit_text(
-            f"Choose a game:\n\n<b>Your balance:</b> {user['balance']} credits",
-            reply_markup=main_menu_kb(),
-            parse_mode=ParseMode.HTML
-        )
+    text = (
+        f"🎰 <b>Casinon Main Menu</b>\n\n"
+        f"💰 Balance: {user['balance']} credits\n\n"
+        "Pick a game or check /balance"
+    )
+    await cb.message.edit_text(text, reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
     await cb.answer()
-
-
-@router.callback_query(F.data == "nav:menu:confirm")
-async def nav_menu_confirm(cb: CallbackQuery):
-    # Abandon active round
-    active_round = await db.get_active_round(cb.from_user.id)
-    if active_round:
-        # Resolve as loss (no payout)
-        await db.resolve_active_round(cb.from_user.id, "loss", 0)
-    
-    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    await cb.message.edit_text(
-        f"Choose a game:\n\n<b>Your balance:</b> {user['balance']} credits",
-        reply_markup=main_menu_kb(),
-        parse_mode=ParseMode.HTML
-    )
-    await cb.answer()
-# ------------------------------------------------------------------------------------
-# Commands
-# ------------------------------------------------------------------------------------
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    user = await db.get_or_create_user(message.from_user.id, message.from_user.username)
-    await message.answer(
-        f"🎰 Welcome to Casinon!\nBalance: {user['balance']} credits\n\nChoose a game:",
-        reply_markup=main_menu_kb(),
-    )
-
-
-@router.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(
-        "Help:\n"
-        "/start — Show main menu\n"
-        "/balance — Show balance and statistics\n"
-        "/history [N|today|week|month] — Show bet history\n"
-        "/help — This help\n\n"
-        "Use inline buttons to navigate and play games.",
-        reply_markup=back_menu_kb(),
-    )
 
 
 @router.message(Command("balance"))
-async def cmd_balance(message: Message):
-    stats = await db.get_balance_stats(message.from_user.id)
-    
-    text = (
-        f"💰 <b>Balance:</b> {stats['balance']} credits\n"
-        f"📊 <b>Total Profit:</b> {stats['total_profit']:+d} credits\n\n"
-        f"📈 <b>Game Statistics:</b>\n"
-        f"   🏆 Wins: {stats['wins']}\n"
-        f"   💥 Losses: {stats['losses']}\n"
-        f"   🤝 Pushes: {stats['pushes']}\n"
-        f"   🎯 Total Games: {stats['wins'] + stats['losses'] + stats['pushes']}"
-    )
-    
-    await message.answer(text, reply_markup=back_menu_kb(), parse_mode=ParseMode.HTML)
+async def cmd_balance(msg: Message):
+    user = await db.get_or_create_user(msg.from_user.id, msg.from_user.username)
+    await msg.answer(f"💰 Balance: {user['balance']} credits", reply_markup=back_menu_kb())
 
 
-@router.message(Command("history"))
-async def cmd_history(message: Message):
-    # Parse command arguments
-    args = message.text.split()[1:] if message.text else []
-    limit = 10
-    filter_type = None
-    
-    if args:
-        arg = args[0].lower()
-        if arg.isdigit():
-            limit = min(int(arg), 50)  # Max 50 records
-        elif arg in ["today", "week", "month"]:
-            filter_type = arg
-    
-    history = await db.get_bet_history(message.from_user.id, limit, filter_type)
-    
-    if not history:
-        text = "📊 <b>Bet History</b>\n\nNo bets found."
-    else:
-        filter_text = f" ({filter_type})" if filter_type else ""
-        text = f"📊 <b>Bet History{filter_text}</b>\n\n"
-        
-        for bet in history:
-            # Parse datetime and format
-            dt = bet['created_at'][:19].replace('T', ' ')
-            result_icon = {"win": "🏆", "loss": "💥", "push": "🤝"}.get(bet['result'], "❓")
-            delta_str = f"{bet['delta']:+d}" if bet['delta'] != 0 else "±0"
-            
-            text += (
-                f"{dt} | <b>{bet['game']}</b>\n"
-                f"Bet: {bet['amount']} | {result_icon} {bet['result'].title()} | {delta_str}\n\n"
-            )
-    
-    await message.answer(text, reply_markup=back_menu_kb(), parse_mode=ParseMode.HTML)
-
-
-# ------------------------------------------------------------------------------------
-# Navigation
-# ------------------------------------------------------------------------------------
-@router.callback_query(F.data == "nav:menu")
-async def nav_menu(cb: CallbackQuery):
-    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    
-    # Check if user has active round and offer to abandon it
-    active_round = await db.get_active_round(cb.from_user.id)
-    if active_round:
-        await cb.message.edit_text(
-            f"⚠️ You have an active {active_round['game']} round with bet {active_round['bet']}.\n\n"
-            "Returning to menu will abandon this round and forfeit your bet.\n"
-            "Are you sure?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Yes, abandon", callback_data="nav:menu:confirm"),
-                    InlineKeyboardButton(text="❌ No, go back", callback_data=f"game:{active_round['game']}")
-                ]
-            ])
-        )
-    else:
-        await cb.message.edit_text(
-            f"Choose a game:\n\n<b>Your balance:</b> {user['balance']} credits",
-            reply_markup=main_menu_kb(),
-            parse_mode=ParseMode.HTML
-        )
-    await cb.answer()
-
-
-@router.callback_query(F.data == "nav:menu:confirm")
-async def nav_menu_confirm(cb: CallbackQuery):
-    # Abandon active round
-    active_round = await db.get_active_round(cb.from_user.id)
-    if active_round:
-        # Resolve as loss (no payout)
-        await db.resolve_active_round(cb.from_user.id, "loss", 0)
-    
-    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    await cb.message.edit_text(
-        f"Choose a game:\n\n<b>Your balance:</b> {user['balance']} credits",
-        reply_markup=main_menu_kb(),
-        parse_mode=ParseMode.HTML
-    )
-    await cb.answer()
-
-
-# ------------------------------------------------------------------------------------
-# Simple 21 Entry
-# ------------------------------------------------------------------------------------
 @router.callback_query(F.data == "game:simple21")
-async def game_simple21(cb: CallbackQuery):
+async def game_simple21_entry(cb: CallbackQuery):
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    
-    # Check for active round first
-    active_round = await db.get_active_round(cb.from_user.id)
-    if active_round and active_round['game'] == 'simple21':
-        # Continue existing round
-        state = json.loads(active_round['state_json'])
-        bet = active_round['bet']
-        
-        player_total = calculate_hand_value(state['player'])
-        dealer_showing = format_hand_display_with_hidden(state['dealer'], hide_first=True)
-        
-        text = (
-            f"2️⃣1️⃣ <b>Simple 21</b> (continued)\n"
-            f"💰 <b>Bet:</b> {bet} credits\n\n"
-            f"🎲 <b>Your hand:</b> {format_hand_display(state['player'])}\n"
-            f"🎯 <b>Dealer shows:</b> {dealer_showing}"
-        )
-        
-        await cb.message.edit_text(
-            text, 
-            reply_markup=build_simple21_actions_kb(),
-            parse_mode=ParseMode.HTML
-        )
-        return await cb.answer("Continuing your round!")
-    
-    # Check balance for new round
     if user["balance"] < settings.min_bet:
-        await cb.message.edit_text(
-            f"2️⃣1️⃣ <b>Simple 21</b>\n\n"
-            f"❌ Insufficient balance. Minimum bet: {settings.min_bet}\n"
-            f"💰 <b>Your balance:</b> {user['balance']} credits",
-            reply_markup=back_menu_kb(),
-            parse_mode=ParseMode.HTML
-        )
-        return await cb.answer()
+        await cb.message.edit_text(f"❌ Not enough balance. Minimum bet: {settings.min_bet}", reply_markup=back_menu_kb())
+        await cb.answer()
+        return
     
-    # Show betting options
+    build_bet_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💵 Bet {settings.min_bet}", callback_data=f"simple21:bet:{settings.min_bet}")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="nav:menu")]
+    ])
+    
     await cb.message.edit_text(
-        f"2️⃣1️⃣ <b>Simple 21</b>\n\n"
-        f"💰 <b>Your balance:</b> {user['balance']} credits\n"
-        "💵 Select your bet:",
-        reply_markup=build_simple21_bet_kb(user["balance"]),
+        f"2️⃣1️⃣ <b>Simple 21</b>\n\n💰 Balance: {user['balance']} credits\n\n💵 Choose bet:",
+        reply_markup=build_bet_kb,
         parse_mode=ParseMode.HTML
     )
     await cb.answer()
 
-
-@router.callback_query(F.data.func(lambda d: d.startswith("game:simple21:bet:")))
+@router.callback_query(F.data.func(lambda d: d.startswith("simple21:bet:")))
 async def simple21_place_bet(cb: CallbackQuery):
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
     try:
         bet = int(cb.data.split(":")[-1])
     except Exception:
         return await cb.answer("Invalid bet.", show_alert=True)
+    if bet < settings.min_bet or bet > settings.max_bet or bet > user["balance"]:
+        return await cb.answer("Invalid bet or insufficient balance.", show_alert=True)
 
-    min_bet = max(settings.min_bet, 1)
-    if bet < min_bet:
-        return await cb.answer(f"Min bet: {min_bet}", show_alert=True)
-    if bet > settings.max_bet:
-        return await cb.answer(f"Max bet: {settings.max_bet}", show_alert=True)
-    if bet > user["balance"]:
-        return await cb.answer("Not enough balance.", show_alert=True)
-
-    # Start round with bet locking
-    player = [draw_card(), draw_card()]
-    dealer = [draw_card()]  # dealer gets second card later
-    
-    state = {
-        "player": player,
-        "dealer": dealer
-    }
-    
+    state = simple21.new_round_state(bet)
     success = await db.start_active_round(cb.from_user.id, "simple21", bet, json.dumps(state))
     if not success:
-        return await cb.answer("❌ Failed to start round. Try again.", show_alert=True)
-
-    player_total = calculate_hand_value(player)
-    dealer_showing = format_hand_display(dealer)  # Only one card, so show it
+        return await cb.answer("Failed to start round.", show_alert=True)
 
     text = (
         f"2️⃣1️⃣ <b>Simple 21</b>\n"
-        f"💰 <b>Bet:</b> {bet} credits (locked)\n\n"
-        f"🎲 <b>Your hand:</b> {format_hand_display(player)}\n"
-        f"🎯 <b>Dealer shows:</b> {dealer_showing}"
+        f"💵 <b>Bet:</b> {bet} credits (locked)\n\n"
+        f"🃏 <b>Your hand:</b> {simple21.format_hand_with_total(state['player'])}\n"
+        f"🀫 <b>Dealer shows:</b> {simple21.format_hand_with_total(state['dealer'])}"
     )
-    
     await cb.message.edit_text(text, reply_markup=build_simple21_actions_kb(), parse_mode=ParseMode.HTML)
-    await cb.answer("Bet locked! Good luck!")
+    await cb.answer("Round started!")
 
 
-# ------------------------------------------------------------------------------------
-# Simple 21 Actions - Same Bet Feature
-# ------------------------------------------------------------------------------------
-@router.callback_query(F.data.func(lambda d: d.startswith("game:simple21:same_bet:")))
-async def simple21_same_bet(cb: CallbackQuery):
-    """Handle same bet replay."""
-    try:
-        bet = int(cb.data.split(":")[-1])
-    except Exception:
-        return await cb.answer("Invalid bet.", show_alert=True)
-    
-    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    
-    if bet > user["balance"]:
-        return await cb.answer("Not enough balance for same bet.", show_alert=True)
-    
-    # Start new round with same bet
-    player = [draw_card(), draw_card()]
-    dealer = [draw_card()]
-    
-    state = {
-        "player": player,
-        "dealer": dealer
-    }
-    
-    success = await db.start_active_round(cb.from_user.id, "simple21", bet, json.dumps(state))
-    if not success:
-        return await cb.answer("❌ Failed to start round. Try again.", show_alert=True)
-
-    text = (
-        f"2️⃣1️⃣ <b>Simple 21</b>\n"
-        f"💰 <b>Bet:</b> {bet} credits (locked)\n\n"
-        f"🎲 <b>Your hand:</b> {format_hand_display(player)}\n"
-        f"🎯 <b>Dealer shows:</b> {format_hand_display(dealer)}"
-    )
-    
-    await cb.message.edit_text(text, reply_markup=build_simple21_actions_kb(), parse_mode=ParseMode.HTML)
-    await cb.answer("New round started!")
-
-
-# ------------------------------------------------------------------------------------
-# Simple 21 Actions
-# ------------------------------------------------------------------------------------
-@router.callback_query(F.data == "game:simple21:hit")
+@router.callback_query(F.data == "simple21:hit")
 async def simple21_hit(cb: CallbackQuery):
-    active_round = await db.get_active_round(cb.from_user.id)
-    if not active_round or active_round['game'] != 'simple21':
+    active = await db.get_active_round(cb.from_user.id)
+    if not active or active["game"] != "simple21":
         return await cb.answer("No active Simple 21 round.", show_alert=True)
+    state = json.loads(active["state_json"])
+    bet = active["bet"]
 
-    state = json.loads(active_round['state_json'])
-    bet = active_round['bet']
-    
-    # Add card to player hand
-    state["player"].append(draw_card())
-    player_total = calculate_hand_value(state["player"])
+    # add card to player
+    state, text_after, finished = simple21.player_hit_logic(state)
 
-    if player_total > 21:
-        # Bust -> loss (no payout)
-        success = await db.resolve_active_round(cb.from_user.id, "loss", 0)
-        if not success:
-            return await cb.answer("Error resolving round.", show_alert=True)
-        
+    # Save intermediate state
+    await db.update_active_round(cb.from_user.id, json.dumps(state))
+
+    # show player's new card first
+    msg = (
+        f"2️⃣1️⃣ <b>Simple 21</b>\n"
+        f"💵 <b>Bet:</b> {bet} credits\n\n"
+        f"🃏 <b>Your hand:</b> {simple21.format_hand_with_total(state['player'])}\n"
+        f"🀫 <b>Dealer shows:</b> {simple21.format_hand_with_total(state['dealer'])}"
+    )
+    await cb.message.edit_text(msg, reply_markup=build_simple21_actions_kb(), parse_mode=ParseMode.HTML)
+
+    # slight pause for effect
+    await asyncio.sleep(0.3)
+
+    if finished:
+        # resolve loss immediately
         user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-        
-        text = (
+        await db.resolve_active_round(cb.from_user.id, "loss", 0)
+        # fetch updated user
+        user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+        final_text = (
             f"💥 <b>BUST!</b>\n\n"
-            f"🎲 <b>Your hand:</b> {format_hand_display(state['player'])}\n"
-            f"🎯 <b>Dealer:</b> {format_hand_display(state['dealer'])}\n\n"
+            f"🃏 <b>Your hand:</b> {simple21.format_hand_with_total(state['player'])}\n"
+            f"🀫 <b>Dealer hand:</b> {simple21.format_hand_with_total(state['dealer'])}\n\n"
             f"❌ <b>Result:</b> Lost {bet} credits\n"
             f"💰 <b>Balance:</b> {user['balance']} credits"
         )
-        
-        await cb.message.edit_text(
-            text, 
-            reply_markup=build_simple21_result_kb(bet, user['balance']),
-            parse_mode=ParseMode.HTML
-        )
-        return await cb.answer("Bust!")
+        await cb.message.edit_text(final_text, reply_markup=simple21.build_simple21_result_kb(bet, user["balance"]), parse_mode=ParseMode.HTML)
+        await cb.answer("Bust!")
+        return
 
-    # Update round state and continue
-    await db.update_active_round(cb.from_user.id, json.dumps(state))
-    
-    text = (
-        f"2️⃣1️⃣ <b>Simple 21</b>\n"
-        f"💰 <b>Bet:</b> {bet} credits\n\n"
-        f"🎲 <b>Your hand:</b> {format_hand_display(state['player'])}\n"
-        f"🎯 <b>Dealer shows:</b> {format_hand_display(state['dealer'])}"
-    )
-    
-    await cb.message.edit_text(text, reply_markup=build_simple21_actions_kb(), parse_mode=ParseMode.HTML)
     await cb.answer()
 
 
-@router.callback_query(F.data == "game:simple21:stand")
+@router.callback_query(F.data == "simple21:stand")
 async def simple21_stand(cb: CallbackQuery):
-    active_round = await db.get_active_round(cb.from_user.id)
-    if not active_round or active_round['game'] != 'simple21':
+    active = await db.get_active_round(cb.from_user.id)
+    if not active or active["game"] != "simple21":
         return await cb.answer("No active Simple 21 round.", show_alert=True)
+    state = json.loads(active["state_json"])
+    bet = active["bet"]
 
-    state = json.loads(active_round['state_json'])
-    bet = active_round['bet']
-    
-    # Dealer draws second card and continues to 17+
-    dealer = state["dealer"][:]
-    while calculate_hand_value(dealer) < 17:
-        dealer.append(draw_card())
+    # Dealer plays and we get final
+    state, final_text, finished = simple21.player_stand_logic(state)
 
-    player_total = calculate_hand_value(state["player"])
-    dealer_total = calculate_hand_value(dealer)
-
-    # Determine result and payout
-    if dealer_total > 21 or player_total > dealer_total:
-        result = "win"
-        payout_delta = 2 * bet  # Win pays 2x bet (net +bet)
-        outcome = f"🏆 <b>YOU WIN!</b> +{bet} credits"
-        result_icon = "🏆"
-    elif player_total < dealer_total:
-        result = "loss"
-        payout_delta = 0  # Loss pays 0 (net -bet) 
-        outcome = f"💥 <b>YOU LOSE!</b> -{bet} credits"
-        result_icon = "💥"
+    # resolve according to result
+    if state["result"] == "win":
+        payout = 2 * bet  # follow simple21 payout convention
+    elif state["result"] == "push":
+        payout = bet
     else:
-        result = "push"
-        payout_delta = bet  # Push returns bet (net ±0)
-        outcome = f"🤝 <b>PUSH!</b> Bet returned"
-        result_icon = "🤝"
+        payout = 0
+    await db.resolve_active_round(cb.from_user.id, state["result"], payout)
 
-    success = await db.resolve_active_round(cb.from_user.id, result, payout_delta)
-    if not success:
-        return await cb.answer("Error resolving round.", show_alert=True)
-    
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-
     text = (
-        f"{result_icon} <b>ROUND COMPLETE</b>\n\n"
-        f"🎲 <b>Your hand:</b> {format_hand_display(state['player'])}\n"
-        f"🎯 <b>Dealer hand:</b> {format_hand_display(dealer)}\n\n"
-        f"📊 <b>Result:</b> {outcome}\n"
-        f"💰 <b>Balance:</b> {user['balance']} credits"
+        f"{final_text}\n\n💰 <b>Balance:</b> {user['balance']} credits"
     )
-    
+    await cb.message.edit_text(text, reply_markup=simple21.build_simple21_result_kb(bet, user["balance"]), parse_mode=ParseMode.HTML)
+    await cb.answer()
+
+
+# ----- Blackjack: full flow (bet placing, hit/stand/double/split/surrender) -----
+@router.callback_query(F.data == "game:blackjack")
+async def game_blackjack_entry(cb: CallbackQuery):
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    if user["balance"] < settings.min_bet:
+        await cb.message.edit_text(f"❌ Not enough balance. Min bet: {settings.min_bet}", reply_markup=back_menu_kb())
+        await cb.answer()
+        return
     await cb.message.edit_text(
-        text, 
-        reply_markup=build_simple21_result_kb(bet, user['balance']),
+        f"🃏 <b>Blackjack</b>\n\n💰 Balance: {user['balance']} credits\n\n💵 Choose bet:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💵 Bet {settings.min_bet}", callback_data=f"blackjack:bet:{settings.min_bet}")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="nav:menu")]
+        ]),
         parse_mode=ParseMode.HTML
     )
     await cb.answer()
 
 
-# ------------------------------------------------------------------------------------
-# Placeholder other games
-# ------------------------------------------------------------------------------------
-@router.callback_query(F.data == "game:blackjack")
-async def game_blackjack(cb: CallbackQuery):
-    await cb.message.edit_text("🃏 Full Blackjack — coming soon!", reply_markup=back_menu_kb())
+@router.callback_query(F.data.func(lambda d: d.startswith("blackjack:bet:")))
+async def blackjack_place_bet(cb: CallbackQuery):
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    try:
+        bet = int(cb.data.split(":")[-1])
+    except Exception:
+        return await cb.answer("Invalid bet.", show_alert=True)
+    if bet < settings.min_bet or bet > settings.max_bet or bet > user["balance"]:
+        return await cb.answer("Invalid bet or insufficient balance.", show_alert=True)
+
+    state_obj = blackjack.BlackjackState(bet)
+    state_json = state_obj.to_json()
+    success = await db.start_active_round(cb.from_user.id, "blackjack", bet, state_json)
+    if not success:
+        return await cb.answer("Failed to start round.", show_alert=True)
+
+    # Check immediate blackjack cases
+    player_hand = state_obj.state["player_hands"][0]
+    dealer = state_obj.state["dealer"]
+    player_bj = state_obj.is_blackjack(player_hand)
+    dealer_bj = state_obj.is_blackjack(dealer)
+
+    # Build initial display
+    text = (
+        f"🃏 <b>Blackjack</b>\n"
+        f"💵 Bet: {bet} credits (locked)\n\n"
+        f"🃏 <b>Your hand:</b> {blackjack.format_hand_with_total(player_hand)}\n"
+        f"🀫 <b>Dealer shows:</b> {state_obj.state['dealer_visible'][0]} {blackjack.HIDDEN_CARD}"
+    )
+
+    # If either has blackjack, reveal and resolve immediately
+    if player_bj or dealer_bj:
+        state_obj.reveal_dealer()
+        state_obj.dealer_play()  # ensures dealer stays consistent (but dealer won't draw if bj)
+        eval_res = state_obj.evaluate()
+        # decide overall payout sum according to evaluate() outputs
+        total_delta = 0
+        overall_result = "push"
+        for typ, payout, _msg in eval_res["results"]:
+            if typ == "win":
+                total_delta += payout
+            elif typ == "push":
+                total_delta += payout
+            # loss adds 0
+        # determine overall_result: if any win and no loss -> win etc.
+        flags = {r[0] for r in eval_res["results"]}
+        if "win" in flags and "loss" not in flags:
+            overall_result = "win"
+        elif "loss" in flags and "win" not in flags:
+            overall_result = "loss"
+        elif flags == {"push"}:
+            overall_result = "push"
+        else:
+            overall_result = "mixed"
+        await db.resolve_active_round(cb.from_user.id, overall_result, total_delta)
+        user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+        # final text
+        final_txt = f"🃏 <b>Blackjack — Round Complete</b>\n\n"
+        for idx, (hand, (typ, payout, msg)) in enumerate(zip(state_obj.state["player_hands"], eval_res["results"])):
+            final_txt += f"🎲 <b>Hand {idx+1}:</b> {blackjack.format_hand_with_total(hand)} — {msg}\n"
+        final_txt += f"\n🀫 <b>Dealer:</b> {' '.join(state_obj.state['dealer'])} (total: {eval_res['dealer_total']})\n\n"
+        final_txt += f"💰 <b>Balance:</b> {user['balance']} credits"
+        await cb.message.edit_text(final_txt, reply_markup=build_blackjack_result_kb(bet, user["balance"]), parse_mode=ParseMode.HTML)
+        await cb.answer()
+        return
+
+    # Normal flow: update DB, show actions
+    await db.update_active_round(cb.from_user.id, state_json)
+    can_double = True
+    can_split = state_obj.can_split()
+    await cb.message.edit_text(text, reply_markup=build_blackjack_actions_kb(can_double=can_double, can_split=can_split), parse_mode=ParseMode.HTML)
+    await cb.answer("Blackjack started!")
+
+
+# helper to load blackjack state object from DB row
+def _load_bj_state(active_row) -> blackjack.BlackjackState:
+    return blackjack.BlackjackState.from_json(active_row["state_json"])
+
+
+@router.callback_query(F.data == "blackjack:hit")
+async def blackjack_hit(cb: CallbackQuery):
+    active = await db.get_active_round(cb.from_user.id)
+    if not active or active["game"] != "blackjack":
+        return await cb.answer("No active Blackjack round.", show_alert=True)
+    state_obj = blackjack.BlackjackState.from_json(active["state_json"])
+    ci = state_obj.state["current_hand"]
+    hand = state_obj.current_hand()
+
+    # draw for player
+    card = state_obj.draw()
+    hand.append(card)
+    # update state
+    state_obj.state["player_hands"][ci] = hand
+    await db.update_active_round(cb.from_user.id, state_obj.to_json())
+
+    # show player's hand immediately
+    text = blackjack.format_hand_with_total(hand)
+    await cb.message.edit_text(
+        f"🃏 <b>Blackjack</b>\n\n🎲 <b>Your hand {ci+1}:</b> {blackjack.format_hand_with_total(hand)}\n🀫 <b>Dealer shows:</b> {' '.join(state_obj.state['dealer_visible'])}",
+        reply_markup=build_blackjack_actions_kb(can_double=(len(hand) == 2), can_split=state_obj.can_split()),
+        parse_mode=ParseMode.HTML
+    )
+
+    # small pause for drama
+    await asyncio.sleep(0.3)
+
+    # check bust
+    if blackjack.calculate_hand_value(hand) > 21:
+        # move to next or resolve
+        state_obj.state["current_hand"] = ci + 1
+        await db.update_active_round(cb.from_user.id, state_obj.to_json())
+        # if more hands exist, continue, else dealer plays & resolve
+        if state_obj.state["current_hand"] < len(state_obj.state["player_hands"]):
+            next_hand = state_obj.state["player_hands"][state_obj.state["current_hand"]]
+            await cb.message.edit_text(
+                f"💥 <b>Hand busted</b>\n\n👉 Next hand {state_obj.state['current_hand']+1}: {blackjack.format_hand_with_total(next_hand)}\n🀫 Dealer shows: {' '.join(state_obj.state['dealer_visible'])}",
+                reply_markup=build_blackjack_actions_kb(can_double=(len(next_hand)==2), can_split=(len(next_hand)==2 and next_hand[0][:-1]==next_hand[1][:-1])),
+                parse_mode=ParseMode.HTML
+            )
+            await cb.answer("Busted this hand, moving on.")
+            return
+        # else resolve
+        # reveal dealers and play
+        state_obj.reveal_dealer()
+        state_obj.dealer_play()
+        eval_res = state_obj.evaluate()
+        total_delta = sum(r[1] for r in eval_res["results"])
+        flags = {r[0] for r in eval_res["results"]}
+        overall = "mixed"
+        if "win" in flags and "loss" not in flags:
+            overall = "win"
+        elif "loss" in flags and "win" not in flags:
+            overall = "loss"
+        elif flags == {"push"}:
+            overall = "push"
+        await db.resolve_active_round(cb.from_user.id, overall, total_delta)
+        user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+        final_txt = f"🃏 <b>Blackjack — Round Complete</b>\n\n"
+        for idx, (hand, (typ, payout, msg)) in enumerate(zip(state_obj.state["player_hands"], eval_res["results"])):
+            final_txt += f"🎲 <b>Hand {idx+1}:</b> {blackjack.format_hand_with_total(hand)} — {msg}\n"
+        final_txt += f"\n🀫 <b>Dealer:</b> {' '.join(state_obj.state['dealer'])} (total: {eval_res['dealer_total']})\n\n"
+        final_txt += f"💰 <b>Balance:</b> {user['balance']} credits"
+        await cb.message.edit_text(final_txt, reply_markup=build_blackjack_result_kb(state_obj.state['original_bet'], user['balance']), parse_mode=ParseMode.HTML)
+        await cb.answer()
+        return
+
     await cb.answer()
 
 
+@router.callback_query(F.data == "blackjack:stand")
+async def blackjack_stand(cb: CallbackQuery):
+    active = await db.get_active_round(cb.from_user.id)
+    if not active or active["game"] != "blackjack":
+        return await cb.answer("No active Blackjack round.", show_alert=True)
+    state_obj = blackjack.BlackjackState.from_json(active["state_json"])
+    # advance to next hand
+    state_obj.state["current_hand"] = state_obj.state["current_hand"] + 1
+    await db.update_active_round(cb.from_user.id, state_obj.to_json())
+
+    if state_obj.state["current_hand"] < len(state_obj.state["player_hands"]):
+        next_hand = state_obj.state["player_hands"][state_obj.state["current_hand"]]
+        await cb.message.edit_text(
+            f"🃏 <b>Blackjack</b>\n\n👉 Now playing hand {state_obj.state['current_hand']+1}: {blackjack.format_hand_with_total(next_hand)}\n🀫 Dealer shows: {' '.join(state_obj.state['dealer_visible'])}",
+            reply_markup=build_blackjack_actions_kb(can_double=(len(next_hand)==2), can_split=(len(next_hand)==2 and next_hand[0][:-1]==next_hand[1][:-1])),
+            parse_mode=ParseMode.HTML
+        )
+        await cb.answer("Stand — next hand.")
+        return
+
+    # else all player hands done: dealer plays and resolve
+    state_obj.reveal_dealer()
+    state_obj.dealer_play()
+    eval_res = state_obj.evaluate()
+    total_delta = sum(r[1] for r in eval_res["results"])
+    flags = {r[0] for r in eval_res["results"]}
+    overall = "mixed"
+    if "win" in flags and "loss" not in flags:
+        overall = "win"
+    elif "loss" in flags and "win" not in flags:
+        overall = "loss"
+    elif flags == {"push"}:
+        overall = "push"
+    await db.resolve_active_round(cb.from_user.id, overall, total_delta)
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    final_txt = f"🃏 <b>Blackjack — Round Complete</b>\n\n"
+    for idx, (hand, (typ, payout, msg)) in enumerate(zip(state_obj.state["player_hands"], eval_res["results"])):
+        final_txt += f"🎲 <b>Hand {idx+1}:</b> {blackjack.format_hand_with_total(hand)} — {msg}\n"
+    final_txt += f"\n🀫 <b>Dealer:</b> {' '.join(state_obj.state['dealer'])} (total: {eval_res['dealer_total']})\n\n"
+    final_txt += f"💰 <b>Balance:</b> {user['balance']} credits"
+    await cb.message.edit_text(final_txt, reply_markup=build_blackjack_result_kb(state_obj.state['original_bet'], user['balance']), parse_mode=ParseMode.HTML)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "blackjack:double")
+async def blackjack_double(cb: CallbackQuery):
+    active = await db.get_active_round(cb.from_user.id)
+    if not active or active["game"] != "blackjack":
+        return await cb.answer("No active Blackjack round.", show_alert=True)
+    state_obj = blackjack.BlackjackState.from_json(active["state_json"])
+    ci = state_obj.state["current_hand"]
+    hand = state_obj.current_hand()
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    bet = state_obj.state["bets"][ci]
+    # validate
+    if len(hand) != 2:
+        return await cb.answer("Double allowed only on first two cards.", show_alert=True)
+    if bet > user["balance"]:
+        return await cb.answer("Not enough balance to double.", show_alert=True)
+    # take extra bet from user's balance via DB resolve later: here we just double the hand bet
+    state_obj.state["bets"][ci] = bet * 2
+    state_obj.state["doubled"][ci] = True
+    # draw one card and move on
+    card = state_obj.draw()
+    hand.append(card)
+    state_obj.state["player_hands"][ci] = hand
+    state_obj.state["current_hand"] = ci + 1
+    await db.update_active_round(cb.from_user.id, state_obj.to_json())
+
+    # show double result and either next hand or resolve
+    if state_obj.state["current_hand"] < len(state_obj.state["player_hands"]):
+        next_hand = state_obj.state["player_hands"][state_obj.state["current_hand"]]
+        await cb.message.edit_text(
+            f"💰 <b>Double</b>\n\n🎲 Hand {ci+1}: {blackjack.format_hand_with_total(hand)}\n👉 Next hand {state_obj.state['current_hand']+1}: {blackjack.format_hand_with_total(next_hand)}\n🀫 Dealer shows: {' '.join(state_obj.state['dealer_visible'])}",
+            reply_markup=build_blackjack_actions_kb(can_double=(len(next_hand)==2), can_split=(len(next_hand)==2 and next_hand[0][:-1]==next_hand[1][:-1])),
+            parse_mode=ParseMode.HTML
+        )
+        await cb.answer("Doubled and moved to next hand.")
+        return
+
+    # else resolve:
+    state_obj.reveal_dealer()
+    state_obj.dealer_play()
+    eval_res = state_obj.evaluate()
+    total_delta = sum(r[1] for r in eval_res["results"])
+    flags = {r[0] for r in eval_res["results"]}
+    overall = "mixed"
+    if "win" in flags and "loss" not in flags:
+        overall = "win"
+    elif "loss" in flags and "win" not in flags:
+        overall = "loss"
+    elif flags == {"push"}:
+        overall = "push"
+    await db.resolve_active_round(cb.from_user.id, overall, total_delta)
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    final_txt = f"🃏 <b>Blackjack — Round Complete</b>\n\n"
+    for idx, (hand, (typ, payout, msg)) in enumerate(zip(state_obj.state["player_hands"], eval_res["results"])):
+        final_txt += f"🎲 <b>Hand {idx+1}:</b> {blackjack.format_hand_with_total(hand)} — {msg}\n"
+    final_txt += f"\n🀫 <b>Dealer:</b> {' '.join(state_obj.state['dealer'])} (total: {eval_res['dealer_total']})\n\n"
+    final_txt += f"💰 <b>Balance:</b> {user['balance']} credits"
+    await cb.message.edit_text(final_txt, reply_markup=build_blackjack_result_kb(state_obj.state['original_bet'], user['balance']), parse_mode=ParseMode.HTML)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "blackjack:split")
+async def blackjack_split(cb: CallbackQuery):
+    active = await db.get_active_round(cb.from_user.id)
+    if not active or active["game"] != "blackjack":
+        return await cb.answer("No active Blackjack round.", show_alert=True)
+    state_obj = blackjack.BlackjackState.from_json(active["state_json"])
+    ci = state_obj.state["current_hand"]
+    hand = state_obj.current_hand()
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    bet = state_obj.state["bets"][ci]
+    # validate split
+    if not state_obj.can_split():
+        return await cb.answer("Cannot split this hand.", show_alert=True)
+    if bet > user["balance"]:
+        return await cb.answer("Not enough balance to split.", show_alert=True)
+    # perform split: create two hands and draw one card for each
+    card_a = hand[0]
+    card_b = hand[1]
+    new1 = [card_a, state_obj.draw()]
+    new2 = [card_b, state_obj.draw()]
+    state_obj.state["player_hands"][ci] = new1
+    state_obj.state["player_hands"].insert(ci + 1, new2)
+    state_obj.state["bets"].insert(ci + 1, bet)
+    # extend flags arrays
+    state_obj.state.setdefault("doubled", [])
+    state_obj.state.setdefault("surrendered", [])
+    state_obj.state["doubled"].insert(ci + 1, False)
+    state_obj.state["surrendered"].insert(ci + 1, False)
+    await db.update_active_round(cb.from_user.id, state_obj.to_json())
+    await cb.message.edit_text(
+        f"🔀 <b>Split</b>\n\n🎲 Hand 1: {blackjack.format_hand_with_total(new1)}\n🎲 Hand 2: {blackjack.format_hand_with_total(new2)}\n🀫 Dealer shows: {' '.join(state_obj.state['dealer_visible'])}",
+        reply_markup=build_blackjack_actions_kb(can_double=True, can_split=False),
+        parse_mode=ParseMode.HTML
+    )
+    await cb.answer("Split performed.")
+
+
+# optional: surrender (with confirm flow)
+@router.callback_query(F.data == "blackjack:surrender")
+async def blackjack_surrender_confirm(cb: CallbackQuery):
+    # We'll implement a two-step flow: first click shows confirm keyboard
+    await cb.message.edit_text(
+        "⚠️ Are you sure you want to Surrender? You'll get back half your bet for this hand.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Yes, surrender", callback_data="blackjack:surrender:confirm"),
+             InlineKeyboardButton(text="❌ No", callback_data="nav:menu")]
+        ])
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "blackjack:surrender:confirm")
+async def blackjack_surrender_execute(cb: CallbackQuery):
+    active = await db.get_active_round(cb.from_user.id)
+    if not active or active["game"] != "blackjack":
+        return await cb.answer("No active Blackjack round.", show_alert=True)
+    state_obj = blackjack.BlackjackState.from_json(active["state_json"])
+    ci = state_obj.state["current_hand"]
+    state_obj.state.setdefault("surrendered", [])
+    # mark surrendered and move on
+    if ci < len(state_obj.state["surrendered"]):
+        state_obj.state["surrendered"][ci] = True
+    else:
+        # extend if necessary
+        while len(state_obj.state["surrendered"]) <= ci:
+            state_obj.state["surrendered"].append(False)
+        state_obj.state["surrendered"][ci] = True
+    # move to next hand or resolve
+    state_obj.state["current_hand"] = ci + 1
+    await db.update_active_round(cb.from_user.id, state_obj.to_json())
+
+    if state_obj.state["current_hand"] < len(state_obj.state["player_hands"]):
+        next_hand = state_obj.state["player_hands"][state_obj.state["current_hand"]]
+        await cb.message.edit_text(
+            f"⚠️ Surrendered hand {ci+1}. Next: {blackjack.format_hand_with_total(next_hand)}\n🀫 Dealer shows: {' '.join(state_obj.state['dealer_visible'])}",
+            reply_markup=build_blackjack_actions_kb(can_double=(len(next_hand)==2), can_split=(len(next_hand)==2 and next_hand[0][:-1]==next_hand[1][:-1])),
+            parse_mode=ParseMode.HTML
+        )
+        await cb.answer("Surrendered this hand.")
+        return
+
+    # else resolve
+    state_obj.reveal_dealer()
+    state_obj.dealer_play()
+    eval_res = state_obj.evaluate()
+    total_delta = sum(r[1] for r in eval_res["results"])
+    flags = {r[0] for r in eval_res["results"]}
+    overall = "mixed"
+    if "win" in flags and "loss" not in flags:
+        overall = "win"
+    elif "loss" in flags and "win" not in flags:
+        overall = "loss"
+    elif flags == {"push"}:
+        overall = "push"
+    await db.resolve_active_round(cb.from_user.id, overall, total_delta)
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    final_txt = f"🃏 <b>Blackjack — Round Complete</b>\n\n"
+    for idx, (hand, (typ, payout, msg)) in enumerate(zip(state_obj.state["player_hands"], eval_res["results"])):
+        final_txt += f"🎲 <b>Hand {idx+1}:</b> {blackjack.format_hand_with_total(hand)} — {msg}\n"
+    final_txt += f"\n🀫 <b>Dealer:</b> {' '.join(state_obj.state['dealer'])} (total: {eval_res['dealer_total']})\n\n"
+    final_txt += f"💰 <b>Balance:</b> {user['balance']} credits"
+    await cb.message.edit_text(final_txt, reply_markup=build_blackjack_result_kb(state_obj.state['original_bet'], user['balance']), parse_mode=ParseMode.HTML)
+    await cb.answer()
+
+
+# ----- Coming soon for roulette -----
 @router.callback_query(F.data == "game:roulette")
 async def game_roulette(cb: CallbackQuery):
-    await cb.message.edit_text("🎡 Roulette — coming soon!", reply_markup=back_menu_kb())
+    await cb.message.edit_text("🎡 Roulette — coming soon! Stay tuned.", reply_markup=back_menu_kb())
     await cb.answer()
 
 
-# ------------------------------------------------------------------------------------
-# Entry point
-# ------------------------------------------------------------------------------------
+# ----- Entrypoint -----
 async def main():
     await db.init()
-    bot = Bot(
-        token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
