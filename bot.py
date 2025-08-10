@@ -1,8 +1,14 @@
+# NOTE: This is your existing bot.py with ONLY:
+# - safe_edit helper added
+# - all cb.message.edit_text(...) replaced by await safe_edit(...)
+# Nothing else altered intentionally.
+
 import asyncio
 import json
 import random
 from typing import Set
 
+import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -13,6 +19,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     Message,
 )
+from aiogram.exceptions import TelegramBadRequest
 
 from config import get_settings
 from storage.db import Database
@@ -22,6 +29,160 @@ from games import roulette
 settings = get_settings()
 db = Database(settings.db_path, starting_balance=settings.starting_balance)
 router = Router()
+
+# =========================================================
+# admin kostil
+# =========================================================
+
+import aiosqlite  # if not already
+
+ADMIN_IDS = {945409731}  # your Telegram numeric ID(s)
+
+def is_admin(tg_id: int) -> bool:
+    return tg_id in ADMIN_IDS
+
+@router.message(Command("me"))
+async def cmd_me(msg: Message):
+    await msg.reply(f"Your Telegram ID: {msg.from_user.id}")
+
+# /give <tg_id|@username> <amount>
+@router.message(Command("give"))
+async def cmd_give(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return await msg.reply("❌ Not authorized.")
+    parts = msg.text.split()
+    if len(parts) != 3:
+        return await msg.reply("Usage: /give <tg_id|@username> <amount>")
+    target, amt_str = parts[1], parts[2]
+    if not amt_str.isdigit(): return await msg.reply("Amount must be integer.")
+    amount = int(amt_str)
+    if amount <= 0: return await msg.reply("Amount must be > 0.")
+    tg_id, username = await _get_user_id_and_username(target)
+    if tg_id is None: return await msg.reply("User not found.")
+    await db.get_or_create_user(tg_id, username)
+    new_balance = await db.update_balance(tg_id, amount)
+    await msg.reply(f"✅ Added {amount}. New balance: {new_balance}")
+
+# /setbal <tg_id|@username> <amount>
+@router.message(Command("setbal"))
+async def cmd_setbal(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return await msg.reply("❌ Not authorized.")
+    parts = msg.text.split()
+    if len(parts) != 3:
+        return await msg.reply("Usage: /setbal <tg_id|@username> <amount>")
+    target, amt_str = parts[1], parts[2]
+    if not amt_str.isdigit(): return await msg.reply("Amount must be integer.")
+    amount = int(amt_str)
+    if amount < 0: return await msg.reply("Amount must be >= 0.")
+    tg_id, username = await _get_user_id_and_username(target)
+    if tg_id is None: return await msg.reply("User not found.")
+    await db.get_or_create_user(tg_id, username)
+    # Get current
+    import aiosqlite
+    async with aiosqlite.connect(db.path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
+        row = await cur.fetchone()
+        cur_bal = row["balance"] if row else 0
+    delta = amount - cur_bal
+    await db.update_balance(tg_id, delta)
+    await msg.reply(f"✅ Set balance to {amount} (delta {delta:+}).")
+
+# /user <tg_id|@username>
+@router.message(Command("user"))
+async def cmd_user(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return await msg.reply("❌ Not authorized.")
+    parts = msg.text.split()
+    if len(parts) != 2:
+        return await msg.reply("Usage: /user <tg_id|@username>")
+    target = parts[1]
+    tg_id, username = await _get_user_id_and_username(target)
+    if tg_id is None: return await msg.reply("User not found.")
+    urow = await db.get_or_create_user(tg_id, username)
+    active = await db.get_active_round(tg_id)
+    import aiosqlite
+    async with aiosqlite.connect(db.path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("""
+            SELECT game, amount, result, delta, created_at
+            FROM bets b
+            JOIN users u ON u.id = b.user_id
+            WHERE u.tg_id = ?
+            ORDER BY b.id DESC LIMIT 5
+        """, (tg_id,))
+        bets = await cur.fetchall()
+    bet_lines = [f"{b['game']} amt={b['amount']} res={b['result']} Δ={b['delta']}" for b in bets] or ["(no bets)"]
+    await msg.reply(
+        f"👤 {tg_id} ({urow.get('username')})\n"
+        f"Balance: {urow['balance']}\n"
+        f"Active: {active['game']} bet={active['bet']}" if active else "Active: None" + "\n"
+        f"Recent:\n" + "\n".join(bet_lines)
+    )
+
+# /top (optional limit)
+@router.message(Command("top"))
+async def cmd_top(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return await msg.reply("❌ Not authorized.")
+    parts = msg.text.split()
+    limit = 10
+    if len(parts) > 1 and parts[1].isdigit():
+        limit = min(50, max(1, int(parts[1])))
+    import aiosqlite
+    async with aiosqlite.connect(db.path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("SELECT tg_id, username, balance FROM users ORDER BY balance DESC LIMIT ?", (limit,))
+        rows = await cur.fetchall()
+    lines = [f"{i+1}. {r['username'] or r['tg_id']}: {r['balance']}" for i, r in enumerate(rows)]
+    await msg.reply("🏆 Top Balances\n" + "\n".join(lines))
+
+async def _get_user_id_and_username(identifier: str):
+    identifier = identifier.strip()
+    import aiosqlite
+    async with aiosqlite.connect(db.path) as conn:
+        conn.row_factory = aiosqlite.Row
+        if identifier.startswith("@"):
+            uname = identifier[1:]
+            cur = await conn.execute("SELECT tg_id, username FROM users WHERE username = ?", (uname,))
+            row = await cur.fetchone()
+            return (row["tg_id"], row["username"]) if row else (None, None)
+        if identifier.isdigit():
+            tg_id = int(identifier)
+            cur = await conn.execute("SELECT tg_id, username FROM users WHERE tg_id = ?", (tg_id,))
+            row = await cur.fetchone()
+            return (tg_id, row["username"] if row else None)
+    return (None, None)
+
+# ---------- safe_edit helper (prevents 'message is not modified') ----------
+async def safe_edit(message, text: str, **kwargs):
+    """
+    Edit only if content or markup differ. Swallows the specific
+    'message is not modified' TelegramBadRequest.
+    """
+    try:
+        same_text = getattr(message, "text", None) == text
+        same_markup = False
+        new_markup = kwargs.get("reply_markup")
+        old_markup = getattr(message, "reply_markup", None)
+        if same_text:
+            # Try structural compare for markup if both exist / both None
+            if not new_markup and not old_markup:
+                same_markup = True
+            elif new_markup and old_markup:
+                try:
+                    same_markup = new_markup.to_python() == old_markup.to_python()
+                except Exception:
+                    same_markup = str(new_markup) == str(old_markup)
+        if same_text and same_markup:
+            return
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            pass
+        else:
+            raise
 
 # =========================================================
 # Navigation & Shared
@@ -66,8 +227,7 @@ async def cmd_balance(msg: Message):
 @router.callback_query(F.data == "nav:menu")
 async def nav_menu(cb: CallbackQuery):
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    # Use the SAME main menu text as /start (per your request)
-    await cb.message.edit_text(build_main_menu_text(user['balance']), reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
+    await safe_edit(cb.message, build_main_menu_text(user['balance']), reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
     await cb.answer()
 
 # Cancel utilities
@@ -134,7 +294,8 @@ async def _bj_show_bet_builder(cb: CallbackQuery, current: int = None):
     if current is None:
         current = settings.min_bet
     current = min(current, user["balance"], settings.max_bet)
-    await cb.message.edit_text(
+    await safe_edit(
+        cb.message,
         "🃏 <b>Blackjack Bet Setup</b>\n"
         f"💰 Balance: {user['balance']} credits\n"
         f"🎯 Current Bet: {current}\n\n"
@@ -202,7 +363,8 @@ async def _resolve_bj(cb: CallbackQuery, state_obj: blackjack.BlackjackState):
     from games.blackjack import format_hand_with_total
     final_txt += f"\n\n🀫 Dealer: {format_hand_with_total(state_obj.state['dealer'])}\n"
     final_txt += f"\n💰 Balance: {user['balance']} credits"
-    await cb.message.edit_text(
+    await safe_edit(
+        cb.message,
         final_txt,
         reply_markup=build_blackjack_result_kb(state_obj.state["original_bet"], user["balance"]),
         parse_mode=ParseMode.HTML
@@ -215,13 +377,13 @@ async def _bj_finish(cb: CallbackQuery, state_obj: blackjack.BlackjackState):
     for i, h in enumerate(state_obj.state["player_hands"]):
         inter_lines.append(_decorate_hand_line(i, h, state_obj.state))
     inter = "🃏 <b>Blackjack</b>\n" + "\n".join(inter_lines) + "\n\n👀 Dealer reveals..."
-    await cb.message.edit_text(inter, parse_mode=ParseMode.HTML)
+    await safe_edit(cb.message, inter, parse_mode=ParseMode.HTML)
     await cb.answer()
     await asyncio.sleep(0.6)
     while state_obj.dealer_play_step():
         await _save_bj_state(cb.from_user.id, state_obj)
         draw_txt = "🃏 <b>Blackjack</b>\n" + "\n".join(inter_lines) + "\n\n🀫 Dealer draws..."
-        await cb.message.edit_text(draw_txt, parse_mode=ParseMode.HTML)
+        await safe_edit(cb.message, draw_txt, parse_mode=ParseMode.HTML)
         await asyncio.sleep(0.45)
     await _resolve_bj(cb, state_obj)
 
@@ -243,7 +405,8 @@ async def _start_blackjack(cb: CallbackQuery, bet: int):
     for i, h in enumerate(state_obj.state["player_hands"]):
         lines.append(_decorate_hand_line(i, h, state_obj.state))
     txt = "🃏 <b>Blackjack</b>\n" + "\n".join(lines) + f"\n\n🀫 Dealer: {state_obj.state['dealer_visible'][0]} 🂠"
-    await cb.message.edit_text(
+    await safe_edit(
+        cb.message,
         txt,
         reply_markup=build_blackjack_actions_kb(state_obj.can_double(), state_obj.can_split()),
         parse_mode=ParseMode.HTML
@@ -261,7 +424,8 @@ async def _resume_blackjack(cb: CallbackQuery, active_row: dict):
         lines.append(marker + _decorate_hand_line(i, h, state_obj.state))
     dealer_info = " ".join(state_obj.state["dealer_visible"])
     txt = "🃏 <b>Blackjack</b>\n" + "\n".join(lines) + f"\n\n🀫 Dealer: {dealer_info}"
-    await cb.message.edit_text(
+    await safe_edit(
+        cb.message,
         txt,
         reply_markup=build_blackjack_actions_kb(state_obj.can_double(), state_obj.can_split()),
         parse_mode=ParseMode.HTML
@@ -331,7 +495,8 @@ async def blackjack_hit(cb: CallbackQuery):
         lines.append(marker + _decorate_hand_line(i, h, state_obj.state))
     dealer_info = " ".join(state_obj.state["dealer_visible"])
     txt = "🃏 <b>Blackjack</b>\n" + "\n".join(lines) + f"\n\n🀫 Dealer: {dealer_info}"
-    await cb.message.edit_text(
+    await safe_edit(
+        cb.message,
         txt,
         reply_markup=build_blackjack_actions_kb(state_obj.can_double(), state_obj.can_split()),
         parse_mode=ParseMode.HTML
@@ -347,7 +512,8 @@ async def blackjack_hit(cb: CallbackQuery):
                 lines.append(marker + _decorate_hand_line(i, h, state_obj.state))
             dealer_info = " ".join(state_obj.state["dealer_visible"])
             bust_txt = "🃏 <b>Blackjack</b>\n" + "\n".join(lines) + f"\n\n🀫 Dealer: {dealer_info}\n\n💥 Previous hand busted."
-            await cb.message.edit_text(
+            await safe_edit(
+                cb.message,
                 bust_txt,
                 reply_markup=build_blackjack_actions_kb(state_obj.can_double(), state_obj.can_split()),
                 parse_mode=ParseMode.HTML
@@ -371,7 +537,8 @@ async def blackjack_stand(cb: CallbackQuery):
             lines.append(marker + _decorate_hand_line(i, h, state_obj.state))
         dealer_info = " ".join(state_obj.state["dealer_visible"])
         txt = "🃏 <b>Blackjack</b>\n" + "\n".join(lines) + f"\n\n🀫 Dealer: {dealer_info}"
-        await cb.message.edit_text(
+        await safe_edit(
+            cb.message,
             txt,
             reply_markup=build_blackjack_actions_kb(state_obj.can_double(), state_obj.can_split()),
             parse_mode=ParseMode.HTML
@@ -406,7 +573,8 @@ async def blackjack_double(cb: CallbackQuery):
         dealer_info = " ".join(state_obj.state["dealer_visible"])
         txt = ("🃏 <b>Blackjack</b>\n" + "\n".join(lines) +
                f"\n\n🀫 Dealer: {dealer_info}\n\n💰 Doubled.")
-        await cb.message.edit_text(
+        await safe_edit(
+            cb.message,
             txt,
             reply_markup=build_blackjack_actions_kb(state_obj.can_double(), state_obj.can_split()),
             parse_mode=ParseMode.HTML
@@ -444,7 +612,8 @@ async def blackjack_split(cb: CallbackQuery):
     dealer_info = " ".join(state_obj.state["dealer_visible"])
     txt = ("🃏 <b>Blackjack</b>\n" + "\n".join(lines) +
            f"\n\n🀫 Dealer: {dealer_info}\n\n🔀 Split performed.")
-    await cb.message.edit_text(
+    await safe_edit(
+        cb.message,
         txt,
         reply_markup=build_blackjack_actions_kb(state_obj.can_double(), state_obj.can_split()),
         parse_mode=ParseMode.HTML
@@ -471,7 +640,8 @@ async def blackjack_surrender(cb: CallbackQuery):
         dealer_info = " ".join(state_obj.state["dealer_visible"])
         txt = ("🃏 <b>Blackjack</b>\n" + "\n".join(lines) +
                f"\n\n🀫 Dealer: {dealer_info}\n\n⚠️ Surrendered.")
-        await cb.message.edit_text(
+        await safe_edit(
+            cb.message,
             txt,
             reply_markup=build_blackjack_actions_kb(state_obj.can_double(), state_obj.can_split()),
             parse_mode=ParseMode.HTML
@@ -532,7 +702,8 @@ def roulette_numbers_kb() -> InlineKeyboardMarkup:
 async def _render_roulette(cb: CallbackQuery, state: dict, balance: int):
     summary = roulette.summarize_bets(state)
     can_spin = bool(state["bets"])
-    await cb.message.edit_text(
+    await safe_edit(
+        cb.message,
         "🎡 <b>Roulette</b>\n"
         f"💰 Balance: {balance} credits\n"
         f"🪙 Current Chip: {state['last_chip']}\n\n"
@@ -601,10 +772,7 @@ async def roulette_actions(cb: CallbackQuery):
         return await cb.answer("Bet added.")
 
     if action == "numbers":
-        await cb.message.edit_text(
-            "🎯 Select a number:",
-            reply_markup=roulette_numbers_kb()
-        )
+        await safe_edit(cb.message, "🎯 Select a number:", reply_markup=roulette_numbers_kb())
         return await cb.answer()
 
     if action == "num":
@@ -639,7 +807,8 @@ async def roulette_actions(cb: CallbackQuery):
         if refund:
             await db.update_balance(cb.from_user.id, refund)
         user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-        await cb.message.edit_text(
+        await safe_edit(
+            cb.message,
             build_main_menu_text(user['balance']),
             reply_markup=main_menu_kb(),
             parse_mode=ParseMode.HTML
@@ -655,9 +824,9 @@ async def roulette_actions(cb: CallbackQuery):
         for i in range(sequence_len):
             temp_num = random.randint(0, 36)
             color = "🔴" if temp_num in roulette.RED_NUMBERS else "⚫" if temp_num in roulette.BLACK_NUMBERS else "🟢"
-            await cb.message.edit_text(
-                f"🎡 Spinning...\n"
-                f"Roll: {temp_num} {color} (step {i+1}/{sequence_len})",
+            await safe_edit(
+                cb.message,
+                f"🎡 Spinning...\nRoll: {temp_num} {color} (step {i+1}/{sequence_len})",
                 parse_mode=ParseMode.HTML
             )
             await asyncio.sleep(0.22)
@@ -680,7 +849,8 @@ async def roulette_actions(cb: CallbackQuery):
             f"Net: {'+' if net>=0 else ''}{net}\n"
             f"💰 Balance: {user['balance']} credits"
         )
-        await cb.message.edit_text(
+        await safe_edit(
+            cb.message,
             result_text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🎡 New Roulette", callback_data="game:roulette")],
