@@ -42,6 +42,9 @@ class Database:
                 );
                 """
             )
+            # Optional performance / locking mitigation
+            await db.execute("PRAGMA journal_mode=WAL;")
+            await db.execute("PRAGMA synchronous=NORMAL;")
             await db.commit()
 
     # ---------------- Users ----------------
@@ -69,11 +72,25 @@ class Database:
             return dict(row)
 
     async def update_balance(self, tg_id: int, delta: int) -> int:
+        """
+        Adjust balance and return new balance.
+        (Fixed: added row_factory so row['balance'] works; prevents TypeError.)
+        """
         async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
             await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (delta, tg_id))
             await db.commit()
             cur = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
             row = await cur.fetchone()
+            if not row:
+                # Edge case: user disappeared (shouldn't happen) -> recreate
+                now = datetime.datetime.utcnow().isoformat()
+                await db.execute(
+                    "INSERT INTO users (tg_id, username, balance, created_at) VALUES (?, ?, ?, ?)",
+                    (tg_id, None, self.starting_balance, now)
+                )
+                await db.commit()
+                return self.starting_balance
             return int(row["balance"])
 
     # ---------------- Bets history ----------------
@@ -93,17 +110,10 @@ class Database:
 
     # ---------------- Active round lifecycle ----------------
     async def start_active_round(self, tg_id: int, game: str, bet: int, state_json: str) -> bool:
-        """
-        Start a new active round:
-          - Fail if one already exists for user.
-          - Check funds >= bet, deduct bet.
-          - Insert row.
-        """
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             try:
                 await db.execute("BEGIN IMMEDIATE")
-
                 cur = await db.execute("SELECT id FROM active_rounds WHERE tg_id = ?", (tg_id,))
                 if await cur.fetchone():
                     await db.rollback()
@@ -124,7 +134,6 @@ class Database:
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (tg_id, game, bet, state_json, now, now)
                 )
-
                 await db.commit()
                 return True
             except Exception:
@@ -132,10 +141,6 @@ class Database:
                 return False
 
     async def adjust_active_round_bet(self, tg_id: int, delta: int) -> bool:
-        """
-        Add (lock) additional bet amount for the active round (splits, doubles, roulette bet additions).
-        Deducts user balance by delta and increases active_rounds.bet by delta.
-        """
         if delta <= 0:
             return False
         async with aiosqlite.connect(self.path) as db:
@@ -153,8 +158,10 @@ class Database:
                     await db.rollback()
                     return False
                 await db.execute("UPDATE users SET balance = balance - ? WHERE tg_id = ?", (delta, tg_id))
-                await db.execute("UPDATE active_rounds SET bet = bet + ?, updated_at = ? WHERE tg_id = ?",
-                                 (delta, datetime.datetime.utcnow().isoformat(), tg_id))
+                await db.execute(
+                    "UPDATE active_rounds SET bet = bet + ?, updated_at = ? WHERE tg_id = ?",
+                    (delta, datetime.datetime.utcnow().isoformat(), tg_id)
+                )
                 await db.commit()
                 return True
             except Exception:
@@ -170,18 +177,13 @@ class Database:
 
     async def update_active_round(self, tg_id: int, state_json: str) -> None:
         async with aiosqlite.connect(self.path) as db:
-            now = datetime.datetime.utcnow().isoformat()
             await db.execute(
                 "UPDATE active_rounds SET state_json = ?, updated_at = ? WHERE tg_id = ?",
-                (state_json, now, tg_id)
+                (state_json, datetime.datetime.utcnow().isoformat(), tg_id)
             )
             await db.commit()
 
     async def resolve_active_round(self, tg_id: int, result: str, total_payout: int) -> None:
-        """
-        Credit total_payout (gross) and remove active round.
-        Net delta = total_payout - locked_total_bet (active_rounds.bet).
-        """
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             try:
