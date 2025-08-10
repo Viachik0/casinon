@@ -1,6 +1,7 @@
 import aiosqlite
 import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
+
 
 class Database:
     def __init__(self, path: str, starting_balance: int):
@@ -50,7 +51,6 @@ class Database:
             cur = await db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
             row = await cur.fetchone()
             if row:
-                # Optionally update username if changed
                 if username and username != row["username"]:
                     await db.execute("UPDATE users SET username = ? WHERE tg_id = ?", (username, tg_id))
                     await db.commit()
@@ -94,12 +94,10 @@ class Database:
     # ---------------- Active round lifecycle ----------------
     async def start_active_round(self, tg_id: int, game: str, bet: int, state_json: str) -> bool:
         """
-        Atomically start a new active round:
-          - Ensures no existing active round for user
-          - Ensures sufficient balance
-          - Deducts bet immediately
-          - Stores round state
-        Returns False on any failure.
+        Start a new active round:
+          - Fail if one already exists for user.
+          - Check funds >= bet, deduct bet.
+          - Insert row.
         """
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
@@ -109,17 +107,16 @@ class Database:
                 cur = await db.execute("SELECT id FROM active_rounds WHERE tg_id = ?", (tg_id,))
                 if await cur.fetchone():
                     await db.rollback()
-                    print(f"[start_active_round] User {tg_id} already has an active round.")
                     return False
 
                 cur = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
                 user = await cur.fetchone()
                 if not user or user["balance"] < bet:
                     await db.rollback()
-                    print(f"[start_active_round] Insufficient balance user {tg_id}.")
                     return False
 
-                await db.execute("UPDATE users SET balance = balance - ? WHERE tg_id = ?", (bet, tg_id))
+                if bet > 0:
+                    await db.execute("UPDATE users SET balance = balance - ? WHERE tg_id = ?", (bet, tg_id))
 
                 now = datetime.datetime.utcnow().isoformat()
                 await db.execute(
@@ -130,8 +127,37 @@ class Database:
 
                 await db.commit()
                 return True
-            except Exception as e:
-                print(f"[start_active_round] Exception: {e}")
+            except Exception:
+                await db.rollback()
+                return False
+
+    async def adjust_active_round_bet(self, tg_id: int, delta: int) -> bool:
+        """
+        Add (lock) additional bet amount for the active round (splits, doubles, roulette bet additions).
+        Deducts user balance by delta and increases active_rounds.bet by delta.
+        """
+        if delta <= 0:
+            return False
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                cur = await db.execute("SELECT * FROM active_rounds WHERE tg_id = ?", (tg_id,))
+                ar = await cur.fetchone()
+                if not ar:
+                    await db.rollback()
+                    return False
+                cur = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
+                user = await cur.fetchone()
+                if not user or user["balance"] < delta:
+                    await db.rollback()
+                    return False
+                await db.execute("UPDATE users SET balance = balance - ? WHERE tg_id = ?", (delta, tg_id))
+                await db.execute("UPDATE active_rounds SET bet = bet + ?, updated_at = ? WHERE tg_id = ?",
+                                 (delta, datetime.datetime.utcnow().isoformat(), tg_id))
+                await db.commit()
+                return True
+            except Exception:
                 await db.rollback()
                 return False
 
@@ -153,9 +179,8 @@ class Database:
 
     async def resolve_active_round(self, tg_id: int, result: str, total_payout: int) -> None:
         """
-        Resolve round: credit payout, record history, remove active_round.
-        total_payout is the GROSS returned amount (chips that go back to balance).
-        Net profit = total_payout - initial bet(s) already locked.
+        Credit total_payout (gross) and remove active round.
+        Net delta = total_payout - locked_total_bet (active_rounds.bet).
         """
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
@@ -166,31 +191,23 @@ class Database:
                 if not active:
                     await db.rollback()
                     return
-                bet_locked = active["bet"]  # original bet locked; splits/doubles not separately tracked here.
-                # Credit user with total_payout
+                locked = active["bet"]
                 await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (total_payout, tg_id))
-
-                # Record bet (delta stored as gross - locked for historical clarity)
-                net_delta = total_payout - bet_locked
-                now = datetime.datetime.utcnow().isoformat()
-                # Need user_id
                 cur = await db.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
                 user_row = await cur.fetchone()
                 if user_row:
+                    net_delta = total_payout - locked
+                    now = datetime.datetime.utcnow().isoformat()
                     await db.execute(
                         "INSERT INTO bets (user_id, game, amount, result, delta, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (user_row["id"], active["game"], bet_locked, result, net_delta, now)
+                        (user_row["id"], active["game"], locked, result, net_delta, now)
                     )
-
-                # Remove active
                 await db.execute("DELETE FROM active_rounds WHERE tg_id = ?", (tg_id,))
                 await db.commit()
-            except Exception as e:
-                print(f"[resolve_active_round] Exception: {e}")
+            except Exception:
                 await db.rollback()
 
     async def delete_active_round(self, tg_id: int) -> None:
-        """Remove an active round without payout (manual cancel)."""
         async with aiosqlite.connect(self.path) as db:
             await db.execute("DELETE FROM active_rounds WHERE tg_id = ?", (tg_id,))
             await db.commit()
